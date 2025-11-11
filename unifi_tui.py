@@ -115,8 +115,10 @@ class UniFiTUI:
         for client in self.clients:
             mac = client.get('mac')
             if mac:
+                # Prefer custom UniFi name, fall back to hostname
+                device_name = client.get('name', '') or client.get('hostname', '')
                 snapshot[mac] = {
-                    'hostname': client.get('hostname', client.get('name', '')),
+                    'hostname': device_name,
                     'ip': client.get('ip', ''),
                     'tx_bytes': client.get('tx_bytes', 0),
                     'rx_bytes': client.get('rx_bytes', 0),
@@ -797,15 +799,19 @@ class UniFiTUI:
             data = client_bandwidth[idx]
             client = data['client']
 
-            # Format client info - hostname + MAC if no hostname
-            hostname = client.get('hostname', client.get('name', ''))
+            # Format client info - prefer custom UniFi name, fall back to hostname
+            custom_name = client.get('name', '')
+            hostname = client.get('hostname', '')
             mac = data['mac']
 
-            if hostname:
-                # Show hostname, truncate if needed
-                client_name = hostname[:20]
+            # Use custom UniFi name if set, otherwise use DHCP hostname
+            display_name = custom_name if custom_name else hostname
+
+            if display_name:
+                # Show name, truncate if needed
+                client_name = display_name[:20]
             else:
-                # No hostname, show MAC
+                # No name at all, show MAC
                 client_name = f"[{mac[:17]}]" if mac else "Unknown"
                 client_name = client_name[:20]
 
@@ -896,10 +902,11 @@ class UniFiTUI:
 
             client = filtered_clients[idx]
 
-            # Format client info
-            hostname = client.get('hostname', client.get('name', ''))[:16]
-            if not hostname:
-                hostname = client.get('mac', 'Unknown')[:16]
+            # Format client info - prefer custom UniFi name
+            display_name = client.get('name', '') or client.get('hostname', '')
+            if not display_name:
+                display_name = client.get('mac', 'Unknown')
+            display_name = display_name[:16]
 
             ip = client.get('ip', 'N/A')[:15]
 
@@ -946,7 +953,7 @@ class UniFiTUI:
             rx_str = self.format_bytes(rx_bytes_r)
             throughput_str = f"{tx_str:>8}/{rx_str:<8}"
 
-            line = f"{hostname:<16} {ip:<15} {connected_to:<15} {signal_str:<8} {throughput_str:<18}"
+            line = f"{display_name:<16} {ip:<15} {connected_to:<15} {signal_str:<8} {throughput_str:<18}"
 
             # Highlight selected
             if i == self.selected_index:
@@ -1094,19 +1101,24 @@ class UniFiTUI:
         clients_sorted = sorted(self.clients, key=get_total_bw, reverse=True)
 
         for i, client in enumerate(clients_sorted[:5]):
-            hostname = client.get('hostname', client.get('name', ''))
+            # Prefer custom UniFi name, fall back to hostname
+            custom_name = client.get('name', '')
+            hostname = client.get('hostname', '')
+            device_name = custom_name if custom_name else hostname
+
             mac = client.get('mac', '')
             ip = client.get('ip', 'N/A')
 
             # Create unique display name
-            if hostname:
-                # Check if hostname is duplicated in list
-                hostname_count = sum(1 for c in clients_sorted[:5] if c.get('hostname', c.get('name', '')) == hostname)
-                if hostname_count > 1:
+            if device_name:
+                # Check if name is duplicated in list
+                name_count = sum(1 for c in clients_sorted[:5]
+                               if (c.get('name', '') or c.get('hostname', '')) == device_name)
+                if name_count > 1:
                     # Add last octet of IP to differentiate
-                    display_name = f"{hostname[:15]} ({ip.split('.')[-1]})"
+                    display_name = f"{device_name[:15]} ({ip.split('.')[-1]})"
                 else:
-                    display_name = hostname[:20]
+                    display_name = device_name[:20]
             else:
                 display_name = f"[{mac[:17]}]"
 
