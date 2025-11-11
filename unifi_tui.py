@@ -6,7 +6,9 @@ UniFi Log Viewer - Interactive TUI using curses
 import curses
 import threading
 import time
-from datetime import datetime
+import sqlite3
+import os
+from datetime import datetime, timedelta
 from unifi_logs_simple import LocalUniFiController, load_config
 
 
@@ -30,6 +32,14 @@ class UniFiTUI:
         self.status_message = "Loading..."
         self.filter_text = ""
         self.filter_mode = False
+
+        # Bandwidth tracking
+        self.bandwidth_time_mode = "realtime"  # realtime, 10min, 1hour
+        self.bandwidth_history = []  # List of (timestamp, client_bandwidth_dict)
+
+        # SQLite database path (if using background collector)
+        self.db_path = 'unifi_stats.db'
+        self.use_database = os.path.exists(self.db_path)
 
         # Initialize curses
         curses.curs_set(0)  # Hide cursor
@@ -88,9 +98,246 @@ class UniFiTUI:
             self.wan_stats = self.controller.get_wan_stats()
             self.port_stats = self.controller.get_port_stats()
             self.last_refresh = datetime.now()
+
+            # Store bandwidth snapshot for historical tracking
+            self._store_bandwidth_snapshot()
+
             self.status_message = f"Last refresh: {self.last_refresh.strftime('%H:%M:%S')}"
         except Exception as e:
             self.status_message = f"Error fetching data: {str(e)}"
+
+    def _store_bandwidth_snapshot(self):
+        """Store current bandwidth data with timestamp."""
+        current_time = time.time()
+
+        # Create snapshot of current client bandwidth
+        snapshot = {}
+        for client in self.clients:
+            mac = client.get('mac')
+            if mac:
+                snapshot[mac] = {
+                    'hostname': client.get('hostname', client.get('name', '')),
+                    'ip': client.get('ip', ''),
+                    'tx_bytes': client.get('tx_bytes', 0),
+                    'rx_bytes': client.get('rx_bytes', 0),
+                    'wired_tx_bytes': client.get('wired_tx_bytes', 0),
+                    'wired_rx_bytes': client.get('wired_rx_bytes', 0),
+                }
+
+        # Add snapshot to history
+        self.bandwidth_history.append((current_time, snapshot))
+
+        # Clean up old snapshots (keep last 1 hour)
+        one_hour_ago = current_time - 3600
+        self.bandwidth_history = [(ts, data) for ts, data in self.bandwidth_history if ts >= one_hour_ago]
+
+    def _get_bandwidth_for_period(self, client_mac):
+        """Calculate total bandwidth for a client over the selected time period."""
+        if self.bandwidth_time_mode == "realtime":
+            # Return current rates
+            client = next((c for c in self.clients if c.get('mac') == client_mac), None)
+            if client:
+                tx = client.get('tx_bytes-r', 0) + client.get('wired-tx_bytes-r', 0)
+                rx = client.get('rx_bytes-r', 0) + client.get('wired-rx_bytes-r', 0)
+                return tx, rx
+            return 0, 0
+
+        # Calculate historical bandwidth
+        current_time = time.time()
+        if self.bandwidth_time_mode == "10min":
+            period_start = current_time - 600  # 10 minutes
+        else:  # 1hour
+            period_start = current_time - 3600  # 1 hour
+
+        # Find first and last snapshot in period
+        period_snapshots = [(ts, data) for ts, data in self.bandwidth_history if ts >= period_start]
+
+        if len(period_snapshots) < 2:
+            return 0, 0
+
+        first_time, first_data = period_snapshots[0]
+        last_time, last_data = period_snapshots[-1]
+
+        if client_mac not in first_data or client_mac not in last_data:
+            return 0, 0
+
+        # Calculate difference in bytes
+        duration = last_time - first_time
+        if duration == 0:
+            return 0, 0
+
+        first = first_data[client_mac]
+        last = last_data[client_mac]
+
+        tx_diff = (last['tx_bytes'] - first['tx_bytes']) + (last['wired_tx_bytes'] - first['wired_tx_bytes'])
+        rx_diff = (last['rx_bytes'] - first['rx_bytes']) + (last['wired_rx_bytes'] - first['wired_rx_bytes'])
+
+        # Convert to bytes per second (average rate over period)
+        tx_rate = tx_diff / duration if duration > 0 else 0
+        rx_rate = rx_diff / duration if duration > 0 else 0
+
+        return max(0, tx_rate), max(0, rx_rate)
+
+    def _get_historical_wan_stats(self, hours=24, max_points=50):
+        """Get WAN statistics from SQLite database for sparklines."""
+        if not self.use_database:
+            return []
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Get data points from last N hours
+            cutoff_time = int(time.time()) - (hours * 3600)
+
+            cursor.execute('''
+                SELECT timestamp, tx_rate, rx_rate, latency
+                FROM wan_stats
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+            ''', (cutoff_time,))
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            # Downsample if we have too many points
+            if len(rows) > max_points:
+                step = len(rows) // max_points
+                rows = rows[::step]
+
+            return rows
+        except Exception as e:
+            return []
+
+    def _get_historical_client_bandwidth(self, mac, hours=24, max_points=50):
+        """Get client bandwidth history from SQLite database."""
+        if not self.use_database:
+            return []
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cutoff_time = int(time.time()) - (hours * 3600)
+
+            cursor.execute('''
+                SELECT timestamp, tx_rate, rx_rate
+                FROM client_bandwidth
+                WHERE mac = ? AND timestamp >= ?
+                ORDER BY timestamp ASC
+            ''', (mac, cutoff_time))
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            # Downsample if needed
+            if len(rows) > max_points:
+                step = len(rows) // max_points
+                rows = rows[::step]
+
+            return rows
+        except Exception as e:
+            return []
+
+    def _get_historical_device_health(self, device_mac, hours=24, max_points=50):
+        """Get device health history from SQLite database."""
+        if not self.use_database:
+            return []
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cutoff_time = int(time.time()) - (hours * 3600)
+
+            cursor.execute('''
+                SELECT timestamp, cpu_usage, mem_usage, temperature
+                FROM device_health
+                WHERE device_mac = ? AND timestamp >= ?
+                ORDER BY timestamp ASC
+            ''', (device_mac, cutoff_time))
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            # Downsample if needed
+            if len(rows) > max_points:
+                step = len(rows) // max_points
+                rows = rows[::step]
+
+            return rows
+        except Exception as e:
+            return []
+
+    def _create_sparkline(self, values, width=20, height=3):
+        """
+        Create ASCII sparkline from values.
+
+        Returns a list of strings representing the sparkline.
+        Uses block characters for better resolution.
+        """
+        if not values or len(values) < 2:
+            return [' ' * width for _ in range(height)]
+
+        # Blocks for different heights (8 levels)
+        blocks = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+
+        # Normalize values to fit in width
+        if len(values) > width:
+            step = len(values) / width
+            normalized = []
+            for i in range(width):
+                idx = int(i * step)
+                normalized.append(values[idx])
+            values = normalized
+        elif len(values) < width:
+            # Pad with the last value
+            values = values + [values[-1]] * (width - len(values))
+
+        # Find min and max
+        min_val = min(values)
+        max_val = max(values)
+
+        if max_val == min_val:
+            # All values are the same
+            mid_block = blocks[4]
+            return [' ' * width for _ in range(height - 1)] + [mid_block * width]
+
+        # Scale values to block height
+        scaled = []
+        for v in values:
+            normalized = (v - min_val) / (max_val - min_val)
+            block_idx = int(normalized * (len(blocks) - 1))
+            scaled.append(blocks[block_idx])
+
+        # For single-line sparkline, just return one line
+        if height == 1:
+            return [''.join(scaled)]
+
+        # For multi-line, distribute vertically
+        lines = []
+        levels_per_line = (len(blocks) - 1) / height
+
+        for line_idx in range(height):
+            line_min = int(line_idx * levels_per_line)
+            line_max = int((line_idx + 1) * levels_per_line)
+            line_chars = []
+
+            for v in values:
+                normalized = (v - min_val) / (max_val - min_val)
+                level = int(normalized * (len(blocks) - 1))
+
+                # Show block if level falls in this line's range
+                if line_min <= level < line_max:
+                    line_chars.append(blocks[level - line_min + 1])
+                elif level >= line_max:
+                    line_chars.append(blocks[-1])
+                else:
+                    line_chars.append(' ')
+
+            lines.append(''.join(line_chars))
+
+        return list(reversed(lines))  # Top to bottom
 
     def draw_menu(self):
         """Draw main menu."""
@@ -102,17 +349,23 @@ class UniFiTUI:
                           curses.color_pair(1) | curses.A_BOLD)
 
         # Menu options - organized into sections
+        # Count security alarms
+        security_count = sum(1 for alarm in self.alarms if self._is_security_alarm(alarm.get('key', '')))
+
         menu_items = [
+            ("0", "Dashboard", "(At-a-Glance Overview)"),
+            ("", "─" * 30, ""),  # Divider
             ("1", "Site Status & Health", f"({len(self.site_health)} subsystems)"),
             ("2", "Controller Resources", "(CPU, Memory, Load)"),
             ("3", "WAN & Network Stats", "(Throughput, Latency)"),
             ("", "─" * 30, ""),  # Divider
             ("4", "Events Log", f"({len(self.events)} events)"),
-            ("5", "Alarms Log", f"({len(self.alarms)} alarms)"),
+            ("5", "Alarms (Recent)", "(Past 3 days)"),
+            ("6", "Security Alerts", f"({security_count} total)"),
             ("", "─" * 30, ""),  # Divider
-            ("6", "Device Inventory", f"({len(self.devices)} devices)"),
-            ("7", "Client Activity", f"({len(self.clients)} clients)"),
-            ("8", "Switch Ports & Traffic", ""),
+            ("7", "Device Inventory", f"({len(self.devices)} devices)"),
+            ("8", "Client Activity", f"({len(self.clients)} clients)"),
+            ("9", "Top Bandwidth Users", "(Real-time Traffic)"),
             ("", "─" * 30, ""),  # Divider
             ("R", "Refresh Data", ""),
             ("Q", "Quit", "")
@@ -210,14 +463,65 @@ class UniFiTUI:
             except:
                 pass
 
+    def _is_security_alarm(self, alarm_key):
+        """Check if alarm is security-related."""
+        SECURITY_ALARM_TYPES = {
+            # Authentication & Access
+            'EVT_AD_LOGIN_FAIL', 'EVT_ADMIN_LOGIN_FAIL',
+            'unauthorized_access', 'EVT_WG_Unauthorized',
+            # Intrusion Detection
+            'EVT_IPS_IpsAlert', 'EVT_IPS_IdsAlert',
+            'EVT_GW_Firewall',
+            # Rogue Devices
+            'rogue_ap', 'EVT_SW_Rogue', 'EVT_AP_Rogue',
+            # Suspicious Activity
+            'EVT_AP_Detected_Rogue_AP', 'EVT_SW_Possible_Rogue'
+        }
+        return any(sec_type in alarm_key for sec_type in SECURITY_ALARM_TYPES)
+
+    def _get_alarm_time(self, alarm):
+        """Extract timestamp from alarm."""
+        for field in ['datetime', 'time', 'timestamp', 'epoch']:
+            timestamp_ms = alarm.get(field)
+            if timestamp_ms:
+                try:
+                    if isinstance(timestamp_ms, str):
+                        # Skip ISO format strings like "2025-10-28T04:27:51Z"
+                        if 'T' in timestamp_ms or '-' in timestamp_ms:
+                            continue
+                        timestamp_ms = int(timestamp_ms)
+                    if isinstance(timestamp_ms, (int, float)):
+                        # Convert to seconds
+                        if timestamp_ms > 10000000000:
+                            return timestamp_ms / 1000
+                        else:
+                            return timestamp_ms
+                except:
+                    continue
+        return None
+
     def draw_alarms(self):
-        """Draw alarms list."""
+        """Draw recent alarms list (past 3 days only)."""
         height, width = self.stdscr.getmaxyx()
 
+        # Filter for recent alarms only
+        three_days_ago = time.time() - (3 * 24 * 60 * 60)
+        recent_alarms = []
+
+        for alarm in self.alarms:
+            alarm_time = self._get_alarm_time(alarm)
+            if alarm_time and alarm_time >= three_days_ago:
+                recent_alarms.append(alarm)
+
         # Header
-        header = f"Alarms Log ({len(self.alarms)} total)"
+        header = f"Recent Alarms (Past 3 Days) - {len(recent_alarms)} total"
         self.stdscr.addstr(1, 2, header, curses.color_pair(3) | curses.A_BOLD)
         self.stdscr.addstr(2, 2, "─" * (width - 4))
+
+        # Show message if no recent alarms
+        if len(recent_alarms) == 0:
+            self.stdscr.addstr(4, 2, "No alarms in the past 3 days", curses.color_pair(2))
+            return
 
         # Alarms list
         list_height = height - 6
@@ -225,47 +529,83 @@ class UniFiTUI:
 
         for i in range(list_height):
             idx = i + self.scroll_offset
-            if idx >= len(self.alarms):
+            if idx >= len(recent_alarms):
                 break
 
-            alarm = self.alarms[idx]
-
-            # Format alarm - try multiple timestamp fields
-            timestamp = '??:??:??'
-            for field in ['datetime', 'time', 'timestamp', 'epoch']:
-                timestamp_ms = alarm.get(field)
-                if timestamp_ms:
-                    try:
-                        # Handle both milliseconds and seconds
-                        if isinstance(timestamp_ms, str):
-                            timestamp_ms = int(timestamp_ms)
-
-                        if isinstance(timestamp_ms, (int, float)):
-                            # If value is too large, it's in milliseconds
-                            if timestamp_ms > 10000000000:
-                                ts = datetime.fromtimestamp(timestamp_ms / 1000)
-                            else:
-                                ts = datetime.fromtimestamp(timestamp_ms)
-                            timestamp = ts.strftime('%Y-%m-%d %H:%M:%S')
-                            break
-                    except:
-                        continue
-
-            alarm_type = alarm.get('key', 'unknown')
-            msg = alarm.get('msg', '')[:width - 35]
-
+            alarm = recent_alarms[idx]
+            timestamp, alarm_type, msg = self._format_alarm(alarm, width)
             line = f"{timestamp} {alarm_type[:15]:<15} {msg}"
 
-            # Highlight selected and use red color
+            attr = curses.color_pair(5) if i == self.selected_index else curses.color_pair(3)
+            try:
+                self.stdscr.addstr(start_y + i, 2, line[:width - 4], attr)
+            except:
+                pass
+
+    def draw_security_alerts(self):
+        """Draw security alerts (all time)."""
+        height, width = self.stdscr.getmaxyx()
+
+        # Filter for security alarms
+        security_alarms = [alarm for alarm in self.alarms if self._is_security_alarm(alarm.get('key', ''))]
+
+        # Header
+        header = f"Security Alerts (All Time) - {len(security_alarms)} total"
+        self.stdscr.addstr(1, 2, header, curses.color_pair(3) | curses.A_BOLD)
+        self.stdscr.addstr(2, 2, "─" * (width - 4))
+
+        # Show message if no security alarms
+        if len(security_alarms) == 0:
+            self.stdscr.addstr(4, 2, "No security alerts found", curses.color_pair(2))
+            return
+
+        # Alarms list
+        list_height = height - 6
+        start_y = 3
+
+        for i in range(list_height):
+            idx = i + self.scroll_offset
+            if idx >= len(security_alarms):
+                break
+
+            alarm = security_alarms[idx]
+            timestamp, alarm_type, msg = self._format_alarm(alarm, width)
+            line = f"{timestamp} {alarm_type[:15]:<15} {msg}"
+
+            # Highlight selected, otherwise bold red for security
             if i == self.selected_index:
                 attr = curses.color_pair(5)
             else:
-                attr = curses.color_pair(3)
+                attr = curses.color_pair(3) | curses.A_BOLD
 
             try:
                 self.stdscr.addstr(start_y + i, 2, line[:width - 4], attr)
             except:
                 pass
+
+    def _format_alarm(self, alarm, width):
+        """Helper to format alarm data."""
+        timestamp = '??:??:??'
+        for field in ['datetime', 'time', 'timestamp', 'epoch']:
+            timestamp_ms = alarm.get(field)
+            if timestamp_ms:
+                try:
+                    if isinstance(timestamp_ms, str):
+                        timestamp_ms = int(timestamp_ms)
+                    if isinstance(timestamp_ms, (int, float)):
+                        if timestamp_ms > 10000000000:
+                            ts = datetime.fromtimestamp(timestamp_ms / 1000)
+                        else:
+                            ts = datetime.fromtimestamp(timestamp_ms)
+                        timestamp = ts.strftime('%Y-%m-%d %H:%M:%S')
+                        break
+                except:
+                    continue
+
+        alarm_type = alarm.get('key', 'unknown')
+        msg = alarm.get('msg', '')[:width - 35]
+
+        return timestamp, alarm_type, msg
 
     def draw_device_inventory(self):
         """Draw enhanced device inventory with MACs, IPs, and adoption state."""
@@ -277,11 +617,12 @@ class UniFiTUI:
         self.stdscr.addstr(2, 2, "─" * (width - 4))
 
         # Column headers
-        col_header = f"{'Name':<18} {'Model':<12} {'IP':<15} {'MAC':<17} {'Status':<10} {'Uptime':<10}"
+        col_header = f"{'Name':<18} {'Model':<12} {'IP':<15} {'MAC':<17} {'Status':<10} {'CPU%':<6} {'Mem%':<6}"
         self.stdscr.addstr(3, 2, col_header, curses.A_BOLD | curses.A_UNDERLINE)
 
-        # Devices list
-        list_height = height - 7
+        # Devices list - reduce height if showing detail panel
+        detail_height = 10 if self.use_database and self.devices else 0
+        list_height = height - 7 - detail_height
         start_y = 4
 
         for i in range(list_height):
@@ -298,19 +639,26 @@ class UniFiTUI:
             mac = device.get('mac', 'N/A')[:17]
             state = device.get('state', 0)
             adopted = device.get('adopted', False)
-            uptime = device.get('uptime', 0)
 
-            # Format uptime
-            if uptime:
-                hours = uptime // 3600
-                minutes = (uptime % 3600) // 60
-                if hours > 24:
-                    days = hours // 24
-                    uptime_str = f"{days}d {hours % 24}h"
-                else:
-                    uptime_str = f"{hours}h {minutes}m"
-            else:
-                uptime_str = "N/A"
+            # Get system stats
+            sys_stats = device.get('sys_stats', {}) or device.get('system-stats', {})
+            cpu_raw = sys_stats.get('cpu', 0) if sys_stats else 0
+            mem_raw = sys_stats.get('mem', 0) if sys_stats else 0
+
+            # Convert to float, handling string values
+            try:
+                cpu = float(cpu_raw) if cpu_raw else 0
+                cpu_str = f"{cpu:>4.0f}%" if cpu else " N/A"
+            except (ValueError, TypeError):
+                cpu = 0
+                cpu_str = " N/A"
+
+            try:
+                mem = float(mem_raw) if mem_raw else 0
+                mem_str = f"{mem:>4.0f}%" if mem else " N/A"
+            except (ValueError, TypeError):
+                mem = 0
+                mem_str = " N/A"
 
             # Status indicator
             if state == 1 and adopted:
@@ -323,7 +671,7 @@ class UniFiTUI:
                 status = "⚠ Pending"
                 status_color = curses.color_pair(4)
 
-            line = f"{name:<18} {model:<12} {ip:<15} {mac:<17} {status:<10} {uptime_str:<10}"
+            line = f"{name:<18} {model:<12} {ip:<15} {mac:<17} {status:<10} {cpu_str:<6} {mem_str:<6}"
 
             # Highlight selected
             if i == self.selected_index:
@@ -335,6 +683,179 @@ class UniFiTUI:
                 self.stdscr.addstr(start_y + i, 2, line[:width - 4], attr)
             except:
                 pass
+
+        # Show detail panel for selected device with sparklines
+        if self.use_database and self.devices and self.selected_index < len(self.devices):
+            selected_device = self.devices[min(self.selected_index + self.scroll_offset, len(self.devices) - 1)]
+            device_mac = selected_device.get('mac')
+
+            if device_mac:
+                detail_y = start_y + list_height + 1
+                self.stdscr.addstr(detail_y, 2, "═" * (width - 4), curses.A_DIM)
+                detail_y += 1
+
+                device_name = selected_device.get('name', 'Unknown')
+                self.stdscr.addstr(detail_y, 2, f"24h History: {device_name}", curses.color_pair(1) | curses.A_BOLD)
+                detail_y += 1
+
+                device_history = self._get_historical_device_health(device_mac, hours=24, max_points=50)
+                if device_history and len(device_history) > 2:
+                    # CPU sparkline
+                    cpu_values = [row[1] for row in device_history if row[1] is not None]
+                    if cpu_values:
+                        sparkline_cpu = self._create_sparkline(cpu_values, width=min(50, width - 20), height=1)
+                        avg_cpu = sum(cpu_values) / len(cpu_values)
+                        max_cpu = max(cpu_values)
+                        self.stdscr.addstr(detail_y, 4, f"CPU: {sparkline_cpu[0]}  Avg: {avg_cpu:.0f}%  Peak: {max_cpu:.0f}%",
+                                         curses.color_pair(2) if max_cpu < 70 else curses.color_pair(4))
+                        detail_y += 1
+
+                    # Memory sparkline
+                    mem_values = [row[2] for row in device_history if row[2] is not None]
+                    if mem_values:
+                        sparkline_mem = self._create_sparkline(mem_values, width=min(50, width - 20), height=1)
+                        avg_mem = sum(mem_values) / len(mem_values)
+                        max_mem = max(mem_values)
+                        self.stdscr.addstr(detail_y, 4, f"MEM: {sparkline_mem[0]}  Avg: {avg_mem:.0f}%  Peak: {max_mem:.0f}%",
+                                         curses.color_pair(2) if max_mem < 80 else curses.color_pair(4))
+                        detail_y += 1
+
+                    # Temperature sparkline
+                    temp_values = [row[3] for row in device_history if row[3] is not None and row[3] > 0]
+                    if temp_values:
+                        sparkline_temp = self._create_sparkline(temp_values, width=min(50, width - 20), height=1)
+                        avg_temp = sum(temp_values) / len(temp_values)
+                        max_temp = max(temp_values)
+                        self.stdscr.addstr(detail_y, 4, f"TMP: {sparkline_temp[0]}  Avg: {avg_temp:.0f}°C  Peak: {max_temp:.0f}°C",
+                                         curses.color_pair(2) if max_temp < 70 else curses.color_pair(3))
+                        detail_y += 1
+                else:
+                    self.stdscr.addstr(detail_y, 4, "Run background collector for 24h trending data", curses.A_DIM)
+                    detail_y += 1
+
+    def draw_top_bandwidth(self):
+        """Draw top bandwidth consumers."""
+        height, width = self.stdscr.getmaxyx()
+
+        # Header with time mode
+        mode_labels = {
+            "realtime": "Real-Time",
+            "10min": "Last 10 Minutes",
+            "1hour": "Last Hour"
+        }
+        mode_label = mode_labels.get(self.bandwidth_time_mode, "Real-Time")
+        header = f"Top Bandwidth Consumers - {mode_label}"
+        self.stdscr.addstr(1, 2, header, curses.color_pair(1) | curses.A_BOLD)
+
+        # Instructions
+        instructions = "(T to toggle time period)"
+        self.stdscr.addstr(1, width - len(instructions) - 2, instructions, curses.color_pair(4) | curses.A_DIM)
+        self.stdscr.addstr(2, 2, "─" * (width - 4))
+
+        # Column headers
+        col_header = f"{'#':<3} {'Hostname':<20} {'IP':<15} {'Download':<11} {'Upload':<11} {'Total':<11}"
+        self.stdscr.addstr(3, 2, col_header, curses.A_BOLD | curses.A_UNDERLINE)
+
+        list_height = height - 7
+        start_y = 4
+
+        # Check if we have enough historical data
+        if self.bandwidth_time_mode != "realtime" and len(self.bandwidth_history) < 2:
+            msg = "Collecting historical data... Please wait a few refresh cycles."
+            self.stdscr.addstr(5, 2, msg, curses.color_pair(4))
+            msg2 = f"(Currently have {len(self.bandwidth_history)} snapshot(s), need at least 2)"
+            self.stdscr.addstr(6, 2, msg2, curses.color_pair(4) | curses.A_DIM)
+            return
+
+        # Build client list with bandwidth for selected period
+        client_bandwidth = []
+        for client in self.clients:
+            mac = client.get('mac')
+            if not mac:
+                continue
+
+            tx, rx = self._get_bandwidth_for_period(mac)
+            total = tx + rx
+
+            client_bandwidth.append({
+                'client': client,
+                'mac': mac,
+                'tx': tx,
+                'rx': rx,
+                'total': total
+            })
+
+        # Sort by total bandwidth
+        client_bandwidth.sort(key=lambda x: x['total'], reverse=True)
+
+        # Display top consumers
+        for i in range(min(list_height, len(client_bandwidth))):
+            idx = i + self.scroll_offset
+            if idx >= len(client_bandwidth):
+                break
+
+            data = client_bandwidth[idx]
+            client = data['client']
+
+            # Format client info - hostname + MAC if no hostname
+            hostname = client.get('hostname', client.get('name', ''))
+            mac = data['mac']
+
+            if hostname:
+                # Show hostname, truncate if needed
+                client_name = hostname[:20]
+            else:
+                # No hostname, show MAC
+                client_name = f"[{mac[:17]}]" if mac else "Unknown"
+                client_name = client_name[:20]
+
+            # IP address
+            ip = client.get('ip', 'N/A')[:15]
+
+            # Get bandwidth rates
+            tx_bytes_r = data['tx']
+            rx_bytes_r = data['rx']
+            total_rate = data['total']
+
+            # Format rates using the format_bytes method (returns KB, MB, GB)
+            download_str = f"{self.format_bytes(rx_bytes_r)}/s"
+            upload_str = f"{self.format_bytes(tx_bytes_r)}/s"
+            total_str = f"{self.format_bytes(total_rate)}/s"
+
+            # Rank
+            rank = f"{idx + 1}."
+
+            line = f"{rank:<3} {client_name:<20} {ip:<15} {download_str:<11} {upload_str:<11} {total_str:<11}"
+
+            # Color based on total bandwidth usage
+            if total_rate > 10 * 1024**2:  # > 10 Mbps
+                attr = curses.color_pair(3)  # Red - heavy usage
+            elif total_rate > 1 * 1024**2:  # > 1 Mbps
+                attr = curses.color_pair(4)  # Yellow - moderate usage
+            elif total_rate > 0:
+                attr = curses.color_pair(2)  # Green - light usage
+            else:
+                attr = curses.A_DIM  # Dim - no activity
+
+            # Highlight selected
+            if i == self.selected_index:
+                attr = curses.color_pair(5)
+
+            try:
+                self.stdscr.addstr(start_y + i, 2, line[:width - 4], attr)
+            except:
+                pass
+
+        # Summary at bottom
+        total_download = sum(c.get('rx_bytes-r', 0) for c in self.clients)
+        total_upload = sum(c.get('tx_bytes-r', 0) for c in self.clients)
+
+        summary_y = height - 2
+        summary = f"Total Network: ↓ {self.format_bytes(total_download)}/s  ↑ {self.format_bytes(total_upload)}/s"
+        try:
+            self.stdscr.addstr(summary_y, 2, summary, curses.color_pair(1) | curses.A_BOLD)
+        except:
+            pass
 
     def draw_clients(self):
         """Draw enhanced client activity list with AP/port info."""
@@ -435,6 +956,213 @@ class UniFiTUI:
                 self.stdscr.addstr(start_y + i, 2, line[:width - 4], attr)
             except:
                 pass
+
+    def draw_dashboard(self):
+        """Draw comprehensive dashboard with all key metrics."""
+        height, width = self.stdscr.getmaxyx()
+
+        # Header
+        title = "Network Dashboard"
+        self.stdscr.addstr(1, (width - len(title)) // 2, title,
+                          curses.color_pair(1) | curses.A_BOLD)
+
+        y = 3
+
+        # ═══ Overall Health Summary ═══
+        devices_online = sum(1 for d in self.devices if d.get('state') == 1)
+        devices_total = len(self.devices)
+        health_pct = int((devices_online / devices_total * 100)) if devices_total > 0 else 0
+
+        health_bar = self.draw_bar(health_pct, 20)
+        health_color = self.get_usage_color(100 - health_pct)  # Inverted - higher is better
+
+        self.stdscr.addstr(y, 2, "Network Health:", curses.A_BOLD)
+        self.stdscr.addstr(y, 20, f"{health_pct}/100 ", health_color)
+        self.stdscr.addstr(y, 30, health_bar, health_color)
+        y += 2
+
+        # ═══ Quick Stats ═══
+        col1_x = 2
+        col2_x = 40
+
+        self.stdscr.addstr(y, col1_x, "Devices:", curses.A_BOLD)
+        device_str = f"{devices_online}/{devices_total} online"
+        device_color = curses.color_pair(2) if devices_online == devices_total else curses.color_pair(4)
+        self.stdscr.addstr(y, col1_x + 12, device_str, device_color)
+
+        self.stdscr.addstr(y, col2_x, "Clients:", curses.A_BOLD)
+        self.stdscr.addstr(y, col2_x + 12, f"{len(self.clients)} active", curses.color_pair(2))
+        y += 1
+
+        self.stdscr.addstr(y, col1_x, "Alarms:", curses.A_BOLD)
+        alarm_count = len(self.alarms)
+        alarm_color = curses.color_pair(3) if alarm_count > 0 else curses.color_pair(2)
+        self.stdscr.addstr(y, col1_x + 12, f"{alarm_count} active", alarm_color)
+
+        self.stdscr.addstr(y, col2_x, "Events:", curses.A_BOLD)
+        self.stdscr.addstr(y, col2_x + 12, f"{len(self.events)} recent", curses.A_NORMAL)
+        y += 2
+
+        # ═══ WAN Status ═══
+        self.stdscr.addstr(y, 2, "═" * (width - 4), curses.A_DIM)
+        y += 1
+        self.stdscr.addstr(y, 2, "WAN Status", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+
+        if self.wan_stats:
+            gateway = self.wan_stats[0]
+            uplink = gateway.get('uplink', {})
+
+            wan_ip = gateway.get('wan1', {}).get('ip', 'N/A')
+            if wan_ip == 'N/A':
+                wan_ip = uplink.get('ip', 'N/A')
+
+            # Get WAN data from uplink for UDM devices
+            latency = uplink.get('latency', gateway.get('latency', 0))
+            tx_bytes_r = uplink.get('tx_bytes-r', gateway.get('tx_bytes-r', 0))
+            rx_bytes_r = uplink.get('rx_bytes-r', gateway.get('rx_bytes-r', 0))
+
+            wan_color = curses.color_pair(2) if wan_ip != 'N/A' else curses.color_pair(3)
+            self.stdscr.addstr(y, col1_x, f"IP: {wan_ip}", wan_color)
+
+            latency_color = self.get_latency_color(latency)
+            self.stdscr.addstr(y, col2_x, f"Latency: {latency}ms", latency_color)
+            y += 1
+
+            self.stdscr.addstr(y, col1_x, f"↓ {self.format_bytes(rx_bytes_r)}/s", curses.color_pair(4))
+            self.stdscr.addstr(y, col2_x, f"↑ {self.format_bytes(tx_bytes_r)}/s", curses.color_pair(4))
+            y += 1
+
+            # Add sparklines if database is available
+            if self.use_database and y < height - 20:
+                wan_history = self._get_historical_wan_stats(hours=24, max_points=40)
+                if wan_history and len(wan_history) > 2:
+                    # Extract download rates
+                    rx_rates = [row[2] for row in wan_history]  # rx_rate column
+                    sparkline = self._create_sparkline(rx_rates, width=40, height=1)
+                    self.stdscr.addstr(y, col1_x, f"24h ↓: {sparkline[0]}", curses.color_pair(2) | curses.A_DIM)
+                    y += 1
+
+            y += 1
+        else:
+            self.stdscr.addstr(y, col1_x, "No WAN data available", curses.A_DIM)
+            y += 2
+
+        # ═══ Controller Resources ═══
+        self.stdscr.addstr(y, 2, "═" * (width - 4), curses.A_DIM)
+        y += 1
+        self.stdscr.addstr(y, 2, "Controller Resources", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+
+        if self.system_info:
+            sysinfo = self.system_info[0]
+            cpu = sysinfo.get('cpu', 0)
+            mem = sysinfo.get('mem', 0)
+
+            cpu_bar = self.draw_bar(cpu, 15)
+            cpu_color = self.get_usage_color(cpu)
+            self.stdscr.addstr(y, col1_x, f"CPU:  {cpu:>5.1f}% ", curses.A_NORMAL)
+            self.stdscr.addstr(y, col1_x + 14, cpu_bar, cpu_color)
+
+            mem_bar = self.draw_bar(mem, 15)
+            mem_color = self.get_usage_color(mem)
+            self.stdscr.addstr(y, col2_x, f"MEM:  {mem:>5.1f}% ", curses.A_NORMAL)
+            self.stdscr.addstr(y, col2_x + 14, mem_bar, mem_color)
+            y += 1
+
+            loadavg = f"{sysinfo.get('loadavg_1', 0):.2f}, {sysinfo.get('loadavg_5', 0):.2f}, {sysinfo.get('loadavg_15', 0):.2f}"
+            self.stdscr.addstr(y, col1_x, f"Load: {loadavg}", curses.A_NORMAL)
+
+            uptime_str = self.format_uptime(sysinfo.get('uptime', 0))
+            self.stdscr.addstr(y, col2_x, f"Uptime: {uptime_str}", curses.A_NORMAL)
+            y += 2
+        else:
+            self.stdscr.addstr(y, col1_x, "No system info available", curses.A_DIM)
+            y += 2
+
+        # ═══ Top 5 Bandwidth Consumers ═══
+        self.stdscr.addstr(y, 2, "═" * (width - 4), curses.A_DIM)
+        y += 1
+        self.stdscr.addstr(y, 2, "Top 5 Bandwidth Users", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+
+        # Sort by total bandwidth (wireless + wired)
+        def get_total_bw(c):
+            return (c.get('tx_bytes-r', 0) + c.get('rx_bytes-r', 0) +
+                    c.get('wired-tx_bytes-r', 0) + c.get('wired-rx_bytes-r', 0))
+
+        clients_sorted = sorted(self.clients, key=get_total_bw, reverse=True)
+
+        for i, client in enumerate(clients_sorted[:5]):
+            hostname = client.get('hostname', client.get('name', ''))
+            mac = client.get('mac', '')
+            ip = client.get('ip', 'N/A')
+
+            # Create unique display name
+            if hostname:
+                # Check if hostname is duplicated in list
+                hostname_count = sum(1 for c in clients_sorted[:5] if c.get('hostname', c.get('name', '')) == hostname)
+                if hostname_count > 1:
+                    # Add last octet of IP to differentiate
+                    display_name = f"{hostname[:15]} ({ip.split('.')[-1]})"
+                else:
+                    display_name = hostname[:20]
+            else:
+                display_name = f"[{mac[:17]}]"
+
+            # Get bandwidth - use wired fields for wired devices, wireless for WiFi
+            rx = client.get('rx_bytes-r', 0) + client.get('wired-rx_bytes-r', 0)
+            tx = client.get('tx_bytes-r', 0) + client.get('wired-tx_bytes-r', 0)
+            total = rx + tx
+
+            if total > 0:
+                rate_str = f"↓{self.format_bytes(rx)}/s ↑{self.format_bytes(tx)}/s"
+                self.stdscr.addstr(y, col1_x, f"{i+1}. {display_name}", curses.A_NORMAL)
+
+                # Color based on rate
+                if total > 10 * 1024**2:
+                    rate_color = curses.color_pair(3)
+                elif total > 1 * 1024**2:
+                    rate_color = curses.color_pair(4)
+                else:
+                    rate_color = curses.color_pair(2)
+
+                self.stdscr.addstr(y, col2_x, rate_str, rate_color)
+                y += 1
+
+        if not any(c.get('tx_bytes-r', 0) + c.get('rx_bytes-r', 0) > 0 for c in clients_sorted[:5]):
+            self.stdscr.addstr(y, col1_x, "No active traffic", curses.A_DIM)
+            y += 1
+
+        y += 1
+
+        # ═══ Recent Issues ═══
+        if y < height - 8:
+            self.stdscr.addstr(y, 2, "═" * (width - 4), curses.A_DIM)
+            y += 1
+            self.stdscr.addstr(y, 2, "Recent Issues", curses.color_pair(1) | curses.A_BOLD)
+            y += 1
+
+            issues_shown = 0
+            # Show offline devices
+            for device in self.devices:
+                if device.get('state') != 1 and issues_shown < 3:
+                    name = device.get('name', 'Unknown')[:30]
+                    self.stdscr.addstr(y, col1_x, f"⚠ Device offline: {name}", curses.color_pair(3))
+                    y += 1
+                    issues_shown += 1
+
+            # Show recent alarms
+            for alarm in self.alarms[:3-issues_shown]:
+                if issues_shown >= 3:
+                    break
+                alarm_type = alarm.get('key', 'unknown')[:30]
+                self.stdscr.addstr(y, col1_x, f"⚠ {alarm_type}", curses.color_pair(4))
+                y += 1
+                issues_shown += 1
+
+            if issues_shown == 0:
+                self.stdscr.addstr(y, col1_x, "✓ No issues detected", curses.color_pair(2))
 
     def draw_site_status(self):
         """Draw site status and health."""
@@ -577,37 +1305,85 @@ class UniFiTUI:
                 model = gateway.get('model', 'Unknown')
                 self.stdscr.addstr(y, 2, f"{name} ({model})", curses.A_BOLD)
 
+                # For UDM/gateway devices, WAN data is in the uplink field
+                uplink = gateway.get('uplink', {})
+
                 # WAN status
                 wan_ip = gateway.get('wan1', {}).get('ip', 'N/A')
+                if wan_ip == 'N/A':
+                    # Fallback to uplink IP if wan1 not available
+                    wan_ip = uplink.get('ip', 'N/A')
                 wan_status = "Connected" if wan_ip != 'N/A' else "Disconnected"
                 status_color = curses.color_pair(2) if wan_ip != 'N/A' else curses.color_pair(3)
                 self.stdscr.addstr(y + 1, 4, f"WAN IP:     {wan_ip}", status_color)
 
-                # Throughput
-                tx_bytes = gateway.get('tx_bytes', 0)
-                rx_bytes = gateway.get('rx_bytes', 0)
+                # Throughput - get from uplink for UDM devices
+                tx_bytes = uplink.get('tx_bytes', gateway.get('tx_bytes', 0))
+                rx_bytes = uplink.get('rx_bytes', gateway.get('rx_bytes', 0))
                 self.stdscr.addstr(y + 2, 4, f"TX Total:   {self.format_bytes(tx_bytes)}", curses.A_NORMAL)
                 self.stdscr.addstr(y + 3, 4, f"RX Total:   {self.format_bytes(rx_bytes)}", curses.A_NORMAL)
 
-                # Throughput rates (bytes per second)
-                tx_bytes_r = gateway.get('tx_bytes-r', 0)
-                rx_bytes_r = gateway.get('rx_bytes-r', 0)
+                # Throughput rates (bytes per second) - get from uplink for UDM devices
+                tx_bytes_r = uplink.get('tx_bytes-r', gateway.get('tx_bytes-r', 0))
+                rx_bytes_r = uplink.get('rx_bytes-r', gateway.get('rx_bytes-r', 0))
                 self.stdscr.addstr(y + 4, 4, f"TX Rate:    {self.format_bytes(tx_bytes_r)}/s", curses.color_pair(4))
                 self.stdscr.addstr(y + 5, 4, f"RX Rate:    {self.format_bytes(rx_bytes_r)}/s", curses.color_pair(4))
 
-                # Latency
-                latency = gateway.get('latency', 0)
+                # Latency - get from uplink for UDM devices
+                latency = uplink.get('latency', gateway.get('latency', 0))
                 latency_color = self.get_latency_color(latency)
                 self.stdscr.addstr(y + 6, 4, f"Latency:    {latency} ms", latency_color)
+
+                # Historical sparklines (24-hour trends)
+                current_y = y + 7
+                if self.use_database and y < height - 15:
+                    wan_history = self._get_historical_wan_stats(hours=24, max_points=50)
+                    if wan_history and len(wan_history) > 2:
+                        self.stdscr.addstr(current_y, 4, "24h History:", curses.color_pair(1))
+                        current_y += 1
+
+                        # Download sparkline
+                        rx_rates = [row[2] for row in wan_history]
+                        sparkline_rx = self._create_sparkline(rx_rates, width=min(60, width - 20), height=1)
+                        self.stdscr.addstr(current_y, 4, f"  ↓ RX: {sparkline_rx[0]}", curses.color_pair(2))
+                        current_y += 1
+
+                        # Upload sparkline
+                        tx_rates = [row[1] for row in wan_history]
+                        sparkline_tx = self._create_sparkline(tx_rates, width=min(60, width - 20), height=1)
+                        self.stdscr.addstr(current_y, 4, f"  ↑ TX: {sparkline_tx[0]}", curses.color_pair(4))
+                        current_y += 1
+
+                        # Latency sparkline
+                        latencies = [row[3] for row in wan_history if row[3] > 0]
+                        if latencies:
+                            sparkline_lat = self._create_sparkline(latencies, width=min(60, width - 20), height=1)
+                            self.stdscr.addstr(current_y, 4, f"  ⏱ Lat: {sparkline_lat[0]}", curses.color_pair(6))
+                            current_y += 1
+
+                        # Stats summary
+                        avg_rx = sum(rx_rates) / len(rx_rates)
+                        max_rx = max(rx_rates)
+                        avg_tx = sum(tx_rates) / len(tx_rates)
+                        max_tx = max(tx_rates)
+                        self.stdscr.addstr(current_y, 4,
+                            f"  Avg: ↓{self.format_bytes(avg_rx)}/s ↑{self.format_bytes(avg_tx)}/s  " +
+                            f"Peak: ↓{self.format_bytes(max_rx)}/s ↑{self.format_bytes(max_tx)}/s",
+                            curses.A_DIM)
+                        current_y += 1
+                    else:
+                        self.stdscr.addstr(current_y, 4, "24h History: Run collector to see trends", curses.A_DIM)
+                        current_y += 1
 
                 # Uptime
                 uptime = gateway.get('uptime', 0)
                 uptime_str = self.format_uptime(uptime)
-                self.stdscr.addstr(y + 7, 4, f"Uptime:     {uptime_str}", curses.A_NORMAL)
+                self.stdscr.addstr(current_y, 4, f"Uptime:     {uptime_str}", curses.A_NORMAL)
+                current_y += 1
 
                 # Connections
                 num_sta = gateway.get('num_sta', 0)
-                self.stdscr.addstr(y + 8, 4, f"Clients:    {num_sta}", curses.A_NORMAL)
+                self.stdscr.addstr(current_y, 4, f"Clients:    {num_sta}", curses.A_NORMAL)
         else:
             self.stdscr.addstr(start_y, 2, "No WAN statistics available", curses.A_DIM)
 
@@ -718,7 +1494,9 @@ class UniFiTUI:
             return f"{b/1024**2:.1f}MB"
         elif b > 1024:
             return f"{b/1024:.1f}KB"
-        return f"{b}B"
+        elif b > 0:
+            return f"{int(b)}B"
+        return "0B"
 
     def format_uptime(self, seconds):
         """Format uptime seconds to human readable."""
@@ -731,8 +1509,9 @@ class UniFiTUI:
         """Draw status bar at bottom."""
         height, width = self.stdscr.getmaxyx()
 
-        # Status message
-        status = self.status_message[:width - 4]
+        # Status message with database indicator
+        db_indicator = " [DB✓]" if self.use_database else ""
+        status = (self.status_message + db_indicator)[:width - 4]
         try:
             self.stdscr.addstr(height - 2, 2, status, curses.color_pair(2))
         except:
@@ -763,6 +1542,8 @@ class UniFiTUI:
         # Draw current view
         if self.current_view == "menu":
             self.draw_menu()
+        elif self.current_view == "dashboard":
+            self.draw_dashboard()
         elif self.current_view == "site_status":
             self.draw_site_status()
         elif self.current_view == "controller":
@@ -773,10 +1554,14 @@ class UniFiTUI:
             self.draw_events()
         elif self.current_view == "alarms":
             self.draw_alarms()
+        elif self.current_view == "security_alerts":
+            self.draw_security_alerts()
         elif self.current_view == "devices":
             self.draw_device_inventory()
         elif self.current_view == "clients":
             self.draw_clients()
+        elif self.current_view == "top_bandwidth":
+            self.draw_top_bandwidth()
         elif self.current_view == "ports":
             self.draw_port_stats()
 
@@ -800,35 +1585,41 @@ class UniFiTUI:
             if key == curses.KEY_UP:
                 self.selected_index = max(0, self.selected_index - 1)
             elif key == curses.KEY_DOWN:
-                self.selected_index = min(9, self.selected_index + 1)
+                self.selected_index = min(11, self.selected_index + 1)
             elif key in [curses.KEY_ENTER, 10, 13]:
                 self.handle_menu_selection()
-            elif key == ord('1'):
+            elif key == ord('0'):
                 self.selected_index = 0
                 self.handle_menu_selection()
-            elif key == ord('2'):
+            elif key == ord('1'):
                 self.selected_index = 1
                 self.handle_menu_selection()
-            elif key == ord('3'):
+            elif key == ord('2'):
                 self.selected_index = 2
                 self.handle_menu_selection()
-            elif key == ord('4'):
+            elif key == ord('3'):
                 self.selected_index = 3
                 self.handle_menu_selection()
-            elif key == ord('5'):
+            elif key == ord('4'):
                 self.selected_index = 4
                 self.handle_menu_selection()
-            elif key == ord('6'):
+            elif key == ord('5'):
                 self.selected_index = 5
                 self.handle_menu_selection()
-            elif key == ord('7'):
+            elif key == ord('6'):
                 self.selected_index = 6
                 self.handle_menu_selection()
-            elif key == ord('8'):
+            elif key == ord('7'):
                 self.selected_index = 7
                 self.handle_menu_selection()
-            elif key in [ord('r'), ord('R')]:
+            elif key == ord('8'):
                 self.selected_index = 8
+                self.handle_menu_selection()
+            elif key == ord('9'):
+                self.selected_index = 9
+                self.handle_menu_selection()
+            elif key in [ord('r'), ord('R')]:
+                self.selected_index = 10
                 self.handle_menu_selection()
             elif key in [ord('q'), ord('Q')]:
                 self.running = False
@@ -860,10 +1651,16 @@ class UniFiTUI:
                 if self.current_view == "events":
                     max_items = len(self.events)
                 elif self.current_view == "alarms":
-                    max_items = len(self.alarms)
+                    # Count recent alarms
+                    three_days_ago = time.time() - (3 * 24 * 60 * 60)
+                    max_items = sum(1 for alarm in self.alarms if self._get_alarm_time(alarm) and self._get_alarm_time(alarm) >= three_days_ago)
+                elif self.current_view == "security_alerts":
+                    max_items = sum(1 for alarm in self.alarms if self._is_security_alarm(alarm.get('key', '')))
                 elif self.current_view == "devices":
                     max_items = len(self.devices)
                 elif self.current_view == "clients":
+                    max_items = len(self.clients)
+                elif self.current_view == "top_bandwidth":
                     max_items = len(self.clients)
                 elif self.current_view == "site_status":
                     max_items = len(self.site_health)
@@ -886,7 +1683,11 @@ class UniFiTUI:
                 if self.current_view == "events":
                     max_items = len(self.events)
                 elif self.current_view == "alarms":
-                    max_items = len(self.alarms)
+                    # Count recent alarms
+                    three_days_ago = time.time() - (3 * 24 * 60 * 60)
+                    max_items = sum(1 for alarm in self.alarms if self._get_alarm_time(alarm) and self._get_alarm_time(alarm) >= three_days_ago)
+                elif self.current_view == "security_alerts":
+                    max_items = sum(1 for alarm in self.alarms if self._is_security_alarm(alarm.get('key', '')))
                 elif self.current_view == "devices":
                     max_items = len(self.devices)
                 elif self.current_view == "clients":
@@ -919,6 +1720,15 @@ class UniFiTUI:
                 self.selected_index = 0
                 self.scroll_offset = 0
                 self.filter_text = ""
+            elif key in [ord('t'), ord('T')]:
+                # Toggle time period in bandwidth view
+                if self.current_view == "top_bandwidth":
+                    if self.bandwidth_time_mode == "realtime":
+                        self.bandwidth_time_mode = "10min"
+                    elif self.bandwidth_time_mode == "10min":
+                        self.bandwidth_time_mode = "1hour"
+                    else:
+                        self.bandwidth_time_mode = "realtime"
             elif key in [ord('r'), ord('R')]:
                 self.fetch_data()
             elif key in [ord('q'), ord('Q')]:
@@ -926,49 +1736,59 @@ class UniFiTUI:
 
     def handle_menu_selection(self):
         """Handle menu item selection."""
-        if self.selected_index == 0:  # Site Status
+        if self.selected_index == 0:  # Dashboard
+            self.current_view = "dashboard"
+            self.selected_index = 0
+            self.scroll_offset = 0
+            self.filter_text = ""
+        elif self.selected_index == 1:  # Site Status
             self.current_view = "site_status"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 1:  # Controller Resources
+        elif self.selected_index == 2:  # Controller Resources
             self.current_view = "controller"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 2:  # WAN & Network Stats
+        elif self.selected_index == 3:  # WAN & Network Stats
             self.current_view = "wan_network"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 3:  # Events
+        elif self.selected_index == 4:  # Events
             self.current_view = "events"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 4:  # Alarms
+        elif self.selected_index == 5:  # Alarms (Recent)
             self.current_view = "alarms"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 5:  # Device Inventory
+        elif self.selected_index == 6:  # Security Alerts
+            self.current_view = "security_alerts"
+            self.selected_index = 0
+            self.scroll_offset = 0
+            self.filter_text = ""
+        elif self.selected_index == 7:  # Device Inventory
             self.current_view = "devices"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 6:  # Clients
+        elif self.selected_index == 8:  # Clients
             self.current_view = "clients"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 7:  # Switch Ports
-            self.current_view = "ports"
+        elif self.selected_index == 9:  # Top Bandwidth
+            self.current_view = "top_bandwidth"
             self.selected_index = 0
             self.scroll_offset = 0
             self.filter_text = ""
-        elif self.selected_index == 8:  # Refresh
+        elif self.selected_index == 10:  # Refresh
             self.fetch_data()
-        elif self.selected_index == 9:  # Quit
+        elif self.selected_index == 11:  # Quit
             self.running = False
 
     def run(self):

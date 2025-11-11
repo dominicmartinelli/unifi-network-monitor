@@ -10,51 +10,89 @@ A comprehensive terminal-based monitoring tool for Ubiquiti UniFi networks. Real
 
 ### 📊 Comprehensive Monitoring Views
 
-1. **Site Status & Health**
+**0. Dashboard (At-a-Glance Overview)** 🆕
+   - Real-time network summary with key metrics
+   - WAN status with 24-hour sparkline trends
+   - Controller resource usage (CPU, memory, load)
+   - Top 5 bandwidth consumers
+   - Recent network issues and alerts
+
+**1. Site Status & Health**
    - Overview dashboard with device/client counts
    - Subsystem health status (LAN, WAN, WLAN, VPN)
    - Color-coded status indicators
 
-2. **Controller Resources**
+**2. Controller Resources**
    - Real-time CPU and memory usage with visual progress bars
    - System load averages (1, 5, 15 minutes)
    - Uptime tracking
    - Temperature monitoring
 
-3. **WAN & Network Statistics**
+**3. WAN & Network Statistics** 🆕
    - WAN connection status and IP address
    - Upload/download throughput (total and real-time rates)
    - Latency monitoring with color-coded indicators
+   - **24-hour historical sparklines** (download, upload, latency)
+   - Average and peak bandwidth statistics
    - Gateway uptime and client count
 
-4. **Events Log**
+**4. Device Inventory** 🆕
+   - Complete device list with MAC addresses, IPs, and CPU/Memory stats
+   - Adoption state tracking and online/offline status
+   - **Interactive device selection with 24-hour health sparklines**
+   - CPU, memory, and temperature trends for selected device
+   - Real-time performance monitoring
+
+**5. Top Bandwidth Consumers** 🆕
+   - Real-time bandwidth tracking per client
+   - **Time period toggle** (T key): Real-time, 10 minutes, 1 hour
+   - Ranked list with download/upload/total rates
+   - Color-coded usage indicators
+   - Hostname and IP display with duplicate differentiation
+
+**6. Recent Alarms** (Past 3 Days)
+   - Filtered alarms from last 3 days
+   - Color-coded severity indicators
+   - Timestamp and detailed alarm information
+
+**7. Security Alerts** (All Time)
+   - Dedicated security-focused alert view
+   - Authentication failures and intrusion detection
+   - Rogue device detection
+   - Firewall and suspicious activity alerts
+
+**8. Events Log**
    - 200 most recent network events
    - Real-time filtering and search
    - Timestamp and event type display
 
-5. **Alarms Log**
-   - Active network alarms
-   - Color-coded severity indicators
-   - Detailed alarm information
-
-6. **Device Inventory**
-   - Complete device list with MAC addresses and IPs
-   - Adoption state tracking
-   - Online/offline status
-   - Uptime for each device
-
-7. **Client Activity**
+**9. Client Activity**
    - Connected clients with hostname/MAC
    - AP or switch port connection details
    - WiFi signal strength (RSSI) with color coding
-   - Real-time throughput per client
-   - Wired vs wireless detection
+   - Real-time throughput per client (wireless + wired)
+   - Connection type detection
 
-8. **Switch Ports & Traffic**
+**10. Switch Ports & Traffic**
    - Per-port statistics for all switches and routers
    - Port status (Up/Down) with color indicators
    - Link speed display
    - Traffic totals (TX/RX) per port
+
+### 📈 Historical Tracking & Analytics 🆕
+
+**Background Statistics Collector**
+- Continuous data collection to SQLite database
+- 30-second interval sampling (configurable)
+- Automatic cleanup of data older than 7 days
+- Tracks client bandwidth, WAN stats, and device health
+
+**ASCII Sparkline Visualizations**
+- 24-hour trend visualization using Unicode block characters
+- Download/upload bandwidth sparklines
+- Latency trends over time
+- Device CPU, memory, and temperature history
+- Average and peak value summaries
 
 ### 🎨 User Interface
 
@@ -114,15 +152,37 @@ verify_ssl_local = false
 
 ## Usage
 
-Run the TUI application:
+### Running the TUI Application
+
 ```bash
 python unifi_tui.py
 ```
 
+### Background Statistics Collector (Optional)
+
+For historical tracking and sparkline visualizations, run the background collector:
+
+```bash
+# Start with default settings (30-second interval)
+python unifi_collector.py
+
+# Or customize the interval and database location
+python unifi_collector.py --interval 60 --database /path/to/stats.db
+```
+
+The collector will:
+- Gather statistics every 30 seconds (configurable)
+- Store data in SQLite database (`unifi_stats.db`)
+- Enable 24-hour sparkline visualizations in the TUI
+- Automatically clean up data older than 7 days
+- Display `[DB✓]` indicator in TUI status bar when active
+
+**Run as a service:** See `SPARKLINES_FEATURES.md` for systemd/launchd setup instructions.
+
 ### Keyboard Controls
 
 **Menu Navigation:**
-- `1-8` - Jump directly to specific view
+- `0-10` - Jump directly to specific view
 - `↑/↓` - Navigate menu items
 - `Enter` - Select menu item
 - `R` - Refresh all data
@@ -132,9 +192,13 @@ python unifi_tui.py
 - `↑/↓` - Scroll through items
 - `PgUp/PgDn` - Page up/down
 - `F` - Toggle filter mode (Events, Clients)
+- `T` - Toggle time period (Top Bandwidth view: realtime/10min/1hour)
 - `R` - Refresh data
 - `ESC` - Return to main menu
 - `Q` - Quit application
+
+**Device Inventory:**
+- `↑/↓` - Select device to view 24-hour health sparklines
 
 **Filter Mode:**
 - Type to filter results
@@ -191,10 +255,16 @@ The application connects to the following UniFi Controller API endpoints:
 
 ## Files
 
-- `unifi_tui.py` - Main TUI application
+- `unifi_tui.py` - Main TUI application with curses interface
+- `unifi_collector.py` - Background statistics collector for historical data
 - `unifi_logs_simple.py` - UniFi API client library
+- `debug_devices.py` - Device data structure debugging tool
+- `debug_bandwidth.py` - Bandwidth calculation debugging tool
 - `.config` - Configuration file (not in repo, create from example)
+- `unifi_stats.db` - SQLite database (created by collector)
+- `SPARKLINES_FEATURES.md` - Documentation for historical tracking features
 - `README.md` - This file
+- `TODO.md` - Planned features and enhancements
 
 ## Security Notes
 

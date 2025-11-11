@@ -349,8 +349,11 @@ class LocalUniFiController:
                 data = response.json()
                 if data.get('meta', {}).get('rc') == 'ok':
                     devices = data.get('data', [])
-                    # Filter for gateway devices
-                    gateways = [d for d in devices if d.get('type') in ['ugw', 'udm', 'uxg']]
+                    # Filter for gateway devices that have WAN interfaces
+                    # Check for devices with gateway types AND wan1 interface
+                    gateways = [d for d in devices
+                               if d.get('type') in ['ugw', 'udm', 'uxg', 'usg']
+                               and (d.get('wan1') or d.get('wan2'))]
                     print(f"  ✓ Retrieved WAN stats for {len(gateways)} gateway(s)")
                     return gateways
                 else:
