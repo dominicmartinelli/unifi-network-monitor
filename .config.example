@@ -1,0 +1,22 @@
+# UniFi API Configuration Example
+# Copy this file to .config and fill in your details
+
+[unifi]
+# Local controller IP address
+local_host = 192.168.1.1
+local_port = 443
+
+# Local controller authentication (username/password)
+local_username = your_username
+local_password = your_password
+
+# Cloud API Key - from https://account.ui.com (Settings > API)
+# Optional - used for cloud features if needed
+cloud_api_key = your_cloud_api_key_here
+
+# Site ID (default: default)
+site = default
+
+# SSL verification
+verify_ssl_cloud = true
+verify_ssl_local = false
