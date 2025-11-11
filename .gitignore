@@ -45,3 +45,21 @@ Thumbs.db
 # Test outputs
 test_*.py
 debug_*.py
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Temporary files
+foo
+tmp/
+temp/
+
+# Additional debug/diagnostic scripts
+check_api_docs.py
+diagnose.py
+discover_endpoints.py
+inspect_host.py
+unifi_logs.py
